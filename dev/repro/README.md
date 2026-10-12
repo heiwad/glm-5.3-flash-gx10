@@ -145,9 +145,15 @@ prompt runs eight times, one at a time under fresh salts, with
 2304, is the entrypoint's `LONG_PREFILL_TOKEN_THRESHOLD`; if you change it or
 `MAX_NUM_BATCHED_TOKENS`, pass the smaller of the two.
 
+The race needs the step to run outside a CUDA graph. With the default
+`MAX_NUM_SEQS=16`, vLLM captures graphs up to 256 tokens and pads every step
+to a multiple of 8, so main showed nothing in 296 runs. With `MAX_NUM_SEQS=4`,
+capture stops at 64 tokens, and steps of 65 to 256 tokens run unpadded.
+
 Without the scatter's wait for its own publish, runs differ only from rank 1's
 rows of the final step on (the second half at TP=2), since causal attention
 keeps a stale row from reaching anything before it. With the wait, runs on one
 boot should all match the first, and a difference that is left comes from
-somewhere else. `experimental/arx/test_ring.py` checks the same path bit for
-bit without a server.
+somewhere else. `experimental/arx/test_ring.py --slow-copy-us 20000` makes
+the race happen on every call without a server: with the scatter's own-publish
+wait removed, all 30 two-shot checks fail.
