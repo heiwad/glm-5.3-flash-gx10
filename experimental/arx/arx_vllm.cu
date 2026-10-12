@@ -48,6 +48,11 @@
 // wait for this rank's own publish as well as the peers' flags.
 // Ctl::mode tells the proxy which pattern a seq uses.
 //
+// Every seq counter is 64-bit: a 32-bit one wraps after 2^32 collectives, and
+// the wrapped value compares below the 64-bit flags.
+// ARX_SEQ_START (debug, default 0, the same on every rank) starts the count
+// elsewhere, so a test can cross 2^32 without running that long.
+//
 // vLLM form: prepare() returns this rank's connection details, the caller
 // all-gathers them over its own group, connect() wires the QPs and starts the
 // proxy, then allreduce(in, out) runs on the current stream and is
@@ -98,6 +103,7 @@ struct PeerInfo {  // what rank r tells everyone about its QPs
   uint32_t mtu[kMaxDev];       // per device: the port's active MTU (enum ibv_mtu)
   uint64_t recv_addr, flag_addr;
   uint32_t recv_rkey[kMaxDev], flag_rkey[kMaxDev];
+  uint64_t seq_start;          // ARX_SEQ_START: every rank must start at the same seq
 };
 
 // ---- GPU side ---------------------------------------------------------------
@@ -120,9 +126,9 @@ struct Dev {
   const __nv_bfloat16* recv;     // [2][world][kSlotBytes / 2]
   const volatile uint64_t* flag; // [2 * world]
   Ctl* ctl;
-  unsigned* seq_dev;             // device: last completed seq
+  unsigned long long* seq_dev;   // device: last completed seq
   unsigned* blocks;         // device [2]: blocks past the copy, blocks finished
-  unsigned* go;                  // device: seq whose peer data has all arrived
+  unsigned long long* go;        // device: seq whose peer data has all arrived
   int rank, world;
 #ifdef ARX_TEST_HOOKS
   long long slow_copy_ns;        // two-shot copy block 1 sleeps this long first (test_ring.py --slow-copy-us)
@@ -174,13 +180,13 @@ __global__ void arx_kernel(Dev d, const __nv_bfloat16* __restrict__ in, __nv_bfl
     if (threadIdx.x < 2 * d.world && threadIdx.x / 2 != d.rank)
       while (ld_acquire_sys(d.flag + threadIdx.x) < seq) {}
     __syncthreads();
-    if (threadIdx.x == 0) { __threadfence(); atomicExch(d.go, (unsigned)seq); }
+    if (threadIdx.x == 0) { __threadfence(); atomicExch(d.go, (unsigned long long)seq); }
   } else {
     if (threadIdx.x == 0)
       while (true) {
-        unsigned g;
-        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(g) : "l"(d.go) : "memory");
-        if (g >= (unsigned)seq) break;
+        unsigned long long g;
+        asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(g) : "l"(d.go) : "memory");
+        if (g >= seq) break;
       }
     __syncthreads();
   }
@@ -207,7 +213,7 @@ __global__ void arx_kernel(Dev d, const __nv_bfloat16* __restrict__ in, __nv_bfl
   __syncthreads();
   if (threadIdx.x == 0 && atomicAdd(&d.blocks[1], 1) == gridDim.x - 1) {  // last block out
     d.blocks[1] = 0;
-    *d.seq_dev = (unsigned)seq;
+    *d.seq_dev = seq;
     d.ctl->done = seq;
   }
 }
@@ -257,13 +263,13 @@ __device__ __forceinline__ uint64_t publish_and_wait(Dev d, const __nv_bfloat16*
     if (threadIdx.x == 0)
       while (ld_acquire_sys(&d.ctl->seq) < seq) {}
     __syncthreads();
-    if (threadIdx.x == 0) { __threadfence(); atomicExch(d.go, (unsigned)seq); }
+    if (threadIdx.x == 0) { __threadfence(); atomicExch(d.go, (unsigned long long)seq); }
   } else {
     if (threadIdx.x == 0)
       while (true) {
-        unsigned g;
-        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(g) : "l"(d.go) : "memory");
-        if (g >= (unsigned)seq) break;
+        unsigned long long g;
+        asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(g) : "l"(d.go) : "memory");
+        if (g >= seq) break;
       }
     __syncthreads();
   }
@@ -274,7 +280,7 @@ __device__ __forceinline__ void finish(Dev d, uint64_t seq) {
   __syncthreads();
   if (threadIdx.x == 0 && atomicAdd(&d.blocks[1], 1) == gridDim.x - 1) {
     d.blocks[1] = 0;
-    *d.seq_dev = (unsigned)seq;
+    *d.seq_dev = seq;
     d.ctl->done = seq;
   }
 }
@@ -345,6 +351,7 @@ struct State {
   std::vector<PeerInfo> all;
   Dev dev{};
   bool connected = false;
+  uint64_t seq_start = 0;  // ARX_SEQ_START
 };
 State S;
 std::atomic<bool> g_proxy_err{false};
@@ -401,14 +408,17 @@ bool post(int c, int r, uint64_t laddr, uint32_t lkey, uint32_t len, uint64_t ro
 }
 
 void proxy_loop() {
-  uint64_t seq = 0, posted[kMaxWorld][2] = {};
+  // Every counter starts at ARX_SEQ_START, as seq_dev and Ctl::seq do: the
+  // proxy posts ctl->seq's successors in order.
+  const uint64_t start = S.seq_start;
+  uint64_t seq = start, posted[kMaxWorld][2] = {};
   const int rank = S.rank, world = S.world;
   auto last_move = std::chrono::steady_clock::now();
-  uint64_t last_done = 0;
+  uint64_t last_done = start;
   bool reported = false;
   // Ring at world 4: the last seq relayed from prev to next, per root, and
   // the size of this rank's own partial for each parity.
-  uint64_t relayed[2] = {}, own_bytes[2] = {};
+  uint64_t relayed[2] = {start, start}, own_bytes[2] = {};
   const bool relay = S.ring && world == 4;
   const volatile uint64_t* flags = S.flag_h;
   IdleNap nap;
@@ -507,12 +517,20 @@ py::bytes arx_prepare(int64_t rank, int64_t world, std::vector<std::string> devs
   TORCH_CHECK((int)devs.size() == S.ndev && (int)gids.size() == S.ndev, "arx: expected ", S.ndev, " devices");
   S.rank = rank; S.world = world; S.ring = ring;
   S.prev = (rank + world - 1) % world; S.next = (rank + 1) % world;
+  const char* start = std::getenv("ARX_SEQ_START");
+  S.seq_start = start && *start ? std::strtoull(start, nullptr, 0) : 0;
+  // Leave room above the start: a value near 2^64 would wrap seq_dev + 1 to 0 while the proxy stays put.
+  TORCH_CHECK(S.seq_start < (1ull << 63), "arx: ARX_SEQ_START must be below 2^63, got ", S.seq_start);
   CK(cudaHostAlloc(&S.send_h, 2 * kSendBytes, cudaHostAllocMapped));
   CK(cudaHostAlloc(&S.recv_h, 2 * world * kSlotBytes, cudaHostAllocMapped));
   CK(cudaHostAlloc(&S.flag_h, 2 * kMaxWorld * sizeof(uint64_t), cudaHostAllocMapped));
   CK(cudaHostAlloc(&S.ctl, sizeof(Ctl), cudaHostAllocMapped));
+  // Peer flags start at 0, below every seq from seq_start + 1 on.
   memset(S.flag_h, 0, 2 * kMaxWorld * sizeof(uint64_t));
   memset((void*)S.ctl, 0, sizeof(Ctl));
+  S.ctl->seq = S.seq_start;
+  S.ctl->done = S.seq_start;
+  S.mine.seq_start = S.seq_start;
   int ndev;
   ibv_device** list = ibv_get_device_list(&ndev);
   const int acc = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
@@ -563,6 +581,8 @@ void arx_connect(std::vector<std::string> infos) {
   for (int j = 0; j < S.world; ++j) {
     TORCH_CHECK(infos[j].size() == sizeof(PeerInfo), "arx: PeerInfo size mismatch");
     memcpy(&S.all[j], infos[j].data(), sizeof(PeerInfo));
+    TORCH_CHECK(S.all[j].seq_start == S.seq_start, "arx: rank ", j, " has ARX_SEQ_START ", S.all[j].seq_start,
+                ", this rank ", S.seq_start);
   }
   for (int c = 0; c < (S.ring ? 2 : S.world); ++c)
     for (int r = 0; r < 2; ++r) {
@@ -594,8 +614,12 @@ void arx_connect(std::vector<std::string> infos) {
   d.slow_copy_ns = slow ? std::atoll(slow) * 1000 : 0;
   fprintf(stderr, "arx rank %d: test build, two-shot copy block 1 sleeps %lld us\n", S.rank, d.slow_copy_ns / 1000);
 #endif
-  CK(cudaMalloc(&d.seq_dev, 4)); CK(cudaMalloc(&d.blocks, 8)); CK(cudaMalloc(&d.go, 4));
-  CK(cudaMemset(d.seq_dev, 0, 4)); CK(cudaMemset(d.blocks, 0, 8)); CK(cudaMemset(d.go, 0, 4));
+  // seq_dev and go start at seq_start, so the first kernel's seq is the
+  // successor the proxy waits for.
+  const unsigned long long start = S.seq_start;
+  CK(cudaMalloc(&d.seq_dev, 8)); CK(cudaMalloc(&d.blocks, 8)); CK(cudaMalloc(&d.go, 8));
+  CK(cudaMemcpy(d.seq_dev, &start, 8, cudaMemcpyHostToDevice)); CK(cudaMemset(d.blocks, 0, 8));
+  CK(cudaMemcpy(d.go, &start, 8, cudaMemcpyHostToDevice));
   CK(cudaDeviceSynchronize());
   std::thread(proxy_loop).detach();
   S.connected = true;

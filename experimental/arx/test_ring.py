@@ -52,6 +52,10 @@ arxbig refuses a ring of 3, so this script stops at its setup. Every rank
 prints its failures and rank 0 ends with "RESULT <mode>: PASS" or "FAIL";
 the exit code is nonzero on a failure. A rank that makes no progress for
 120 s says where it was and exits.
+
+--wrap starts arx's sequence counter just below 2^32 (ARX_SEQ_START on every
+rank), so the first size checks carry it across the 32-bit wrap and every
+check after runs above it.
 """
 import argparse
 import hashlib
@@ -271,10 +275,13 @@ def main():
     p.add_argument("--bursts", type=int, default=20, help="bursts of 16 mixed collectives")
     p.add_argument("--slow-copy-us", type=int, default=0,
                    help="check the two-shot sizes only, with rank 1's copy block 1 held back this long")
+    p.add_argument("--wrap", action="store_true", help="start arx's seq 16 below 2^32 and run across the wrap")
     args = p.parse_args()
 
     os.environ["VLLM_ARX_RING"] = "1" if args.mode == "ring" else "0"
     os.environ["VLLM_ARXBIG_RS"] = "1"
+    if args.wrap:
+        os.environ["ARX_SEQ_START"] = str((1 << 32) - 16)
     if "GLOO_SOCKET_IFNAME" not in os.environ and "VLLM_HOST_IP" in os.environ:
         os.environ["GLOO_SOCKET_IFNAME"] = lan_iface(os.environ["VLLM_HOST_IP"])
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
