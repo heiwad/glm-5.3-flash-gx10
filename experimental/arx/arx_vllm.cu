@@ -124,6 +124,9 @@ struct Dev {
   unsigned* blocks;         // device [2]: blocks past the copy, blocks finished
   unsigned* go;                  // device: seq whose peer data has all arrived
   int rank, world;
+#ifdef ARX_TEST_HOOKS
+  long long slow_copy_ns;        // two-shot copy block 1 sleeps this long first (test_ring.py --slow-copy-us)
+#endif
 };
 
 // Weight ranges the next kernels read; the kernel asks L2 for them before it waits.
@@ -217,6 +220,19 @@ __device__ __forceinline__ uint64_t publish_and_wait(Dev d, const __nv_bfloat16*
   const int par = seq & 1;
   __nv_bfloat16* mine = d.send + (size_t)par * (kSendBytes / 2);
   const int stride = gridDim.x * blockDim.x * 8;
+#ifdef ARX_TEST_HOOKS
+  if (blockIdx.x == 1 && d.slow_copy_ns > 0) {
+    if (threadIdx.x == 0) {
+      unsigned long long t0, t;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+      do {
+        __nanosleep(1000);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+      } while (t - t0 < (unsigned long long)d.slow_copy_ns);
+    }
+    __syncthreads();
+  }
+#endif
   for (int i = (blockIdx.x * blockDim.x + threadIdx.x) * 8; i < n; i += stride)
     *reinterpret_cast<uint4*>(mine + i) = *reinterpret_cast<const uint4*>(in + i);
   __threadfence_system();
@@ -573,6 +589,11 @@ void arx_connect(std::vector<std::string> infos) {
   Dev& d = S.dev;
   d.send = (__nv_bfloat16*)S.send_h; d.recv = (const __nv_bfloat16*)S.recv_h; d.flag = S.flag_h; d.ctl = S.ctl;
   d.rank = S.rank; d.world = S.world;
+#ifdef ARX_TEST_HOOKS
+  const char* slow = std::getenv("ARX_TEST_SLOW_COPY_US");
+  d.slow_copy_ns = slow ? std::atoll(slow) * 1000 : 0;
+  fprintf(stderr, "arx rank %d: test build, two-shot copy block 1 sleeps %lld us\n", S.rank, d.slow_copy_ns / 1000);
+#endif
   CK(cudaMalloc(&d.seq_dev, 4)); CK(cudaMalloc(&d.blocks, 8)); CK(cudaMalloc(&d.go, 4));
   CK(cudaMemset(d.seq_dev, 0, 4)); CK(cudaMemset(d.blocks, 0, 8)); CK(cudaMemset(d.go, 0, 4));
   CK(cudaDeviceSynchronize());

@@ -114,10 +114,14 @@ def _jit_load(name, *args, **kwargs):
 def _load():
     global _ext
     if _ext is None:
+        # ARX_TEST_SLOW_COPY_US (test_ring.py --slow-copy-us) builds a separate extension with test hooks;
+        # the serving build is never compiled with them.
+        test = "ARX_TEST_SLOW_COPY_US" in os.environ
         _ext = _jit_load(
-            "arx_vllm",
+            "arx_vllm_test" if test else "arx_vllm",
             [os.path.join(os.path.dirname(__file__), "arx_vllm.cu")],
-            extra_cuda_cflags=["-O3", "-std=c++17", "-gencode=arch=compute_121a,code=sm_121a"],
+            extra_cuda_cflags=["-O3", "-std=c++17", "-gencode=arch=compute_121a,code=sm_121a"]
+            + (["-DARX_TEST_HOOKS"] if test else []),
             extra_ldflags=["-libverbs"],
         )
     return _ext
