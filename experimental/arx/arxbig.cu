@@ -48,6 +48,12 @@
 // bounds, behind the relay. At the final destination the mesh argument holds
 // as is. Relayed data for seq + 2 left its source after the source finished
 // seq + 1, and that needed the destination's seq + 1 data.
+//
+// Failing loudly, as in arx_vllm.cu: the proxy writes Ctl::err before it
+// exits on an error, and every GPU spin-wait polls it and the
+// ARX_SPIN_TIMEOUT_S deadline, then traps with a one-line reason.
+// ARX_FAIL_AFTER (test hook, default off) counts collectives here.
+#include <cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -89,9 +95,17 @@ struct Work {
   uint64_t op, seq, chunk, slice, lo, hi;
   volatile uint64_t tag;
 };
+// Ctl::err, set by the proxy before it exits.
+enum : uint64_t { kErrPost = 1, kErrCompletion = 2, kErrInjected = 3, kErrRelayBehind = 4 };
+// Ctl::gpu_err, set by a GPU spin-wait before it traps.
+enum : uint64_t { kGpuSawErr = 1, kGpuTimeout = 2 };
+constexpr int kQpTimeout = 18;  // QP retry timeout exponent, ~1.07 s per try: see arx_vllm.cu
+
 struct Ctl {                    // pinned; written by the GPU, read by the proxy
   Work ring[kRing];
   volatile uint64_t stop;
+  volatile uint64_t err;        // written by the proxy: why it stopped (kErr*), 0 while it runs
+  volatile uint64_t gpu_err;    // written by the GPU: why it trapped (kGpu*)
 };
 
 struct PeerInfo {
@@ -116,6 +130,7 @@ struct Dev {
   int nslot;      // flag words per op
   uint32_t mask;  // the words of an op that carry data for this rank
   size_t slot_bytes;
+  uint64_t spin_ns;  // spin-wait deadline, 0 = wait forever
 };
 
 __device__ __forceinline__ uint64_t ld_acquire_sys(const volatile uint64_t* p) {
@@ -128,6 +143,35 @@ __device__ __forceinline__ uint4 ld_cv(const void* p) {
   uint4 v;
   asm volatile("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
   return v;
+}
+
+__device__ __forceinline__ uint64_t globaltimer() {  // ns, the same on every SM
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+// Out of line so the spin loops stay small. Device printf can be lost with the
+// trapped context, so the code also goes to Ctl::gpu_err for the proxy to log.
+__device__ __noinline__ void spin_fail(const Dev& d, uint64_t code, uint64_t seq, const char* what, int idx,
+                                       uint64_t want, uint64_t have) {
+  d.ctl->gpu_err = code;
+  __threadfence_system();
+  printf("arxbig rank %d seq %llu: %s waiting for %s %d (want %llu, have %llu, proxy err %llu), trapping\n",
+         d.rank, (unsigned long long)seq, code == kGpuTimeout ? "timed out" : "relay failed", what, idx,
+         (unsigned long long)want, (unsigned long long)have, (unsigned long long)d.ctl->err);
+  __trap();
+}
+
+// Called on every turn of a spin-wait. Every 1024 turns it checks the proxy's
+// error word and the deadline, so the hot loop stays a single load.
+__device__ __forceinline__ void spin_tick(const Dev& d, unsigned& n, uint64_t& t0, uint64_t seq, const char* what,
+                                          int idx, uint64_t want, uint64_t have) {
+  if (++n & 1023) return;
+  if (ld_acquire_sys(&d.ctl->err)) spin_fail(d, kGpuSawErr, seq, what, idx, want, have);
+  const uint64_t now = globaltimer();
+  if (t0 == 0) t0 = now;  // the clock starts at the first check: short waits never read it
+  else if (d.spin_ns && now - t0 > d.spin_ns) spin_fail(d, kGpuTimeout, seq, what, idx, want, have);
 }
 
 #ifndef RS_CACHED
@@ -191,15 +235,18 @@ __device__ void copy_publish(const Dev& d, const uint8_t* src, uint8_t* dst, siz
 // own_publish: also wait until this rank published piece c itself (rs_kernel).
 __device__ void wait_piece(const Dev& d, uint64_t op, uint64_t seq, int c, bool own_publish = false) {
   const uint64_t want = flag_of(seq, c);
+  unsigned spins = 0;
+  uint64_t t0 = 0;
   if (blockIdx.x == 0) {
     const volatile uint64_t* f = d.flag + (op == kAllGather ? 0 : d.nslot);
     if (threadIdx.x < d.nslot && (d.mask >> threadIdx.x & 1))
-      while (ld_acquire_sys(f + threadIdx.x) < want) {}
+      for (uint64_t v; (v = ld_acquire_sys(f + threadIdx.x)) < want;)
+        spin_tick(d, spins, t0, seq, "peer flag", threadIdx.x, want, v);
     if (own_publish && threadIdx.x == 0)
-      while (true) {
-        unsigned long long g;
+      for (uint64_t g;;) {
         asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(g) : "l"(d.published) : "memory");
         if (g >= want) break;
+        spin_tick(d, spins, t0, seq, "own publish", 0, want, g);
       }
     __syncthreads();
     if (threadIdx.x == 0) { __threadfence(); atomicMax(d.ready, (unsigned long long)want); }
@@ -209,6 +256,7 @@ __device__ void wait_piece(const Dev& d, uint64_t op, uint64_t seq, int c, bool 
         unsigned long long g;
         asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(g) : "l"(d.ready) : "memory");
         if (g >= want) break;
+        spin_tick(d, spins, t0, seq, "ready", blockIdx.x, want, g);
       }
     __syncthreads();
   }
@@ -388,9 +436,30 @@ struct State {
   std::vector<PeerInfo> all;
   Dev dev{};
   bool connected = false;
+  double spin_s = 300;      // ARX_SPIN_TIMEOUT_S
+  uint64_t fail_after = 0;  // ARX_FAIL_AFTER, in collectives
 };
 State S;
 std::atomic<bool> g_err{false};
+
+void read_env() {
+  const char* sp = std::getenv("ARX_SPIN_TIMEOUT_S");
+  S.spin_s = sp && *sp ? std::atof(sp) : 300;
+  // Finite and at most a day, so spin_s * 1e9 fits the uint64_t deadline.
+  TORCH_CHECK(std::isfinite(S.spin_s) && S.spin_s >= 0 && S.spin_s <= 86400,
+              "arxbig: ARX_SPIN_TIMEOUT_S must be between 0 and 86400, got ", S.spin_s);
+  const char* fa = std::getenv("ARX_FAIL_AFTER");
+  S.fail_after = fa && *fa ? std::strtoull(fa, nullptr, 0) : 0;
+}
+
+// Records why the proxy stops, for the GPU spin-waits, then logs it.
+void proxy_fail(uint64_t code, const char* why) {
+  S.ctl->err = code;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  g_err = true;
+  fprintf(stderr, "arxbig rank %d: proxy stopped (err %lu): %s; waiting GPUs will trap\n", S.rank,
+          (unsigned long)code, why);
+}
 
 int chan_peer(int c) { return S.ring ? (c ? S.next : S.prev) : c; }
 int chan_dev(int c, int r) { return S.ring ? c * 2 + r : r; }         // device here
@@ -599,6 +668,10 @@ void proxy_loop() {
   const bool relay = S.ring && world == 4;
   static Relays R;
   auto send = S.ring ? ring_send_chunk : send_piece;
+  // ARX_FAIL_AFTER counts collectives, not pieces: every piece of a seq is
+  // published before the next seq's (stream order), so a new seq is a new one.
+  uint64_t last_seq = 0, ncoll = 0;
+  bool gpu_reported = false;
   IdleNap nap;
   while (!S.ctl->stop) {
     bool moved = false;
@@ -608,12 +681,20 @@ void proxy_loop() {
       if (n > 0) moved = true;
       for (int i = 0; i < n; ++i)
         if (wc[i].status != IBV_WC_SUCCESS) {
-          fprintf(stderr, "arxbig rank %d: completion error %d\n", rank, wc[i].status);
-          g_err = true;
+          char why[128];
+          snprintf(why, sizeof why, "completion error %d (%s) on device %d", wc[i].status,
+                   ibv_wc_status_str(wc[i].status), d);
+          proxy_fail(kErrCompletion, why);
           return;
         }
     }
-    if (relay && !relay_step(R)) { g_err = true; return; }
+    if (relay && !relay_step(R)) { proxy_fail(kErrPost, "relay post failed"); return; }
+    if (S.ctl->gpu_err && !gpu_reported) {
+      gpu_reported = true;
+      fprintf(stderr, "arxbig rank %d: GPU trapped in a spin-wait (gpu_err %lu: %s), last seq %lu\n", rank,
+              (unsigned long)S.ctl->gpu_err, S.ctl->gpu_err == kGpuTimeout ? "timeout" : "saw proxy error",
+              (unsigned long)last_seq);
+    }
     Work& slot = S.ctl->ring[done % kRing];
     if (slot.tag != done + 1) {
       if (moved || (relay && relay_pending(R))) nap.busy(); else nap.idle();
@@ -624,16 +705,25 @@ void proxy_loop() {
     Work it;
     it.op = slot.op; it.seq = slot.seq; it.chunk = slot.chunk; it.slice = slot.slice; it.lo = slot.lo; it.hi = slot.hi;
     ++done;
-    if (relay && !relay_note(R, it)) { g_err = true; return; }
+    if (it.seq != last_seq) {
+      last_seq = it.seq;
+      if (S.fail_after && ++ncoll == S.fail_after) {  // ARX_FAIL_AFTER: test hook
+        char why[96];
+        snprintf(why, sizeof why, "injected failure at seq %lu (ARX_FAIL_AFTER)", (unsigned long)it.seq);
+        proxy_fail(kErrInjected, why);
+        return;
+      }
+    }
+    if (relay && !relay_note(R, it)) { proxy_fail(kErrRelayBehind, "relays fell behind"); return; }
     if (it.op == kAllGather && S.ring) {
       uint64_t flag = it.seq * 16 + it.chunk + 1;
-      if (!ring_send_ag(it, &flag)) { g_err = true; return; }
+      if (!ring_send_ag(it, &flag)) { proxy_fail(kErrPost, "post failed"); return; }
       continue;
     }
     if (it.op != kRsPiece) {  // one piece for every peer
       uint64_t flag = it.seq * 16 + it.chunk + 1;  // inline: copied at post time
       for (int k = 1; k < world; ++k)
-        if (!send(it, (rank + k) % world, &flag)) { g_err = true; return; }
+        if (!send(it, (rank + k) % world, &flag)) { proxy_fail(kErrPost, "post failed"); return; }
       continue;
     }
     // Row piece `sub` of destination j's chunk. Peers read the flag as "all
@@ -646,7 +736,7 @@ void proxy_loop() {
     while (next_k[j] < kChunks && (pend_mask[j] >> next_k[j] & 1)) {
       const int k = next_k[j]++;
       uint64_t flag = it.seq * 16 + k + 1;
-      if (!send(pend[j][k], j, &flag)) { g_err = true; return; }
+      if (!send(pend[j][k], j, &flag)) { proxy_fail(kErrPost, "post failed"); return; }
     }
   }
 }
@@ -658,6 +748,7 @@ Dev make_dev() {
   CK(cudaMemset(d.blocks, 0, kChunks * kMaxWorld * 4)); CK(cudaMemset(d.ready, 0, 8)); CK(cudaMemset(d.work_next, 0, 8));
   CK(cudaMalloc(&d.published, 8)); CK(cudaMemset(d.published, 0, 8));
   d.rank = S.rank; d.world = S.world; d.slot_bytes = S.slot_bytes;
+  d.spin_ns = (uint64_t)(S.spin_s * 1e9);
   d.nslot = S.nslot;
   for (int src = 0; src < S.world; ++src) {
     if (src == S.rank) continue;
@@ -683,6 +774,7 @@ py::bytes prepare(int64_t rank, int64_t world, std::vector<std::string> devs, st
               ": the ring reduce-scatter sends the rank two away half each way. Set VLLM_ARXBIG=0 to run arx alone");
   S.ndev = ring ? 4 : 2;
   TORCH_CHECK((int)devs.size() == S.ndev && (int)gids.size() == S.ndev, "arxbig: expected ", S.ndev, " devices");
+  read_env();
   S.rank = rank; S.world = world; S.ring = ring; S.slot_bytes = slot_bytes; S.rs_slot_bytes = rs_slot_bytes;
   S.prev = (rank + world - 1) % world; S.next = (rank + 1) % world;
   S.nslot = (ring ? 4 : 2) * world;
@@ -763,7 +855,8 @@ void connect(std::vector<std::string> infos) {
       if (S.ring || c == (S.rank + 1) % S.world)
         fprintf(stderr, "arxbig rank %d%s root %d: path MTU %d bytes (ours %d, peer %d)\n", S.rank,
                 S.ring ? (c ? " next" : " prev") : "", r, 128 << a.path_mtu, 128 << S.mine.mtu[d], 128 << p.mtu[rd]);
-      a.qp_state = IBV_QPS_RTS; a.timeout = 14; a.retry_cnt = 7; a.rnr_retry = 7; a.sq_psn = 0; a.max_rd_atomic = 1;
+      a.qp_state = IBV_QPS_RTS; a.timeout = kQpTimeout; a.retry_cnt = 7; a.rnr_retry = 7; a.sq_psn = 0;
+      a.max_rd_atomic = 1;
       IBCK(ibv_modify_qp(S.qp[c][r], &a, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
                                               IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC) == 0);
     }

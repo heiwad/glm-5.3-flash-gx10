@@ -56,6 +56,14 @@ the exit code is nonzero on a failure. A rank that makes no progress for
 --wrap starts arx's sequence counter just below 2^32 (ARX_SEQ_START on every
 rank), so the first size checks carry it across the 32-bit wrap and every
 check after runs above it.
+
+--inject-failure N checks that a relay failure stops the ranks instead of
+hanging them, and runs nothing else. Rank 0's arx proxy fails at its Nth
+collective (ARX_FAIL_AFTER), with ARX_SPIN_TIMEOUT_S at 20 s unless set.
+Rank 0's GPU sees the proxy's error and traps; the others wait for rank 0's
+flag until the deadline and trap. Every rank must get a CUDA error from the
+trap: a CUDA error and the kernel's own "trapping" line. A host-side error or the
+proxy's log alone fails. Rank 0 ends with "RESULT inject: PASS".
 """
 import argparse
 import hashlib
@@ -63,6 +71,7 @@ import os
 import random
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zlib
@@ -268,6 +277,54 @@ class Test:
             print(f"[{self.mode}] {msg}", flush=True)
 
 
+def inject_failure(T: Test, n: int) -> None:
+    """Runs n + 8 all-reduces with rank 0's proxy set to fail at the nth, and checks every rank traps."""
+    T.dog.at("inject")
+    x = gen((4096,), BF16, "inject")
+    out = torch.empty_like(x)
+    dist.barrier()
+    # Device printf goes to stdout and the proxy logs to stderr: collect both
+    # to check for the reason, then pass them on.
+    log = tempfile.TemporaryFile()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved = os.dup(1), os.dup(2)
+    os.dup2(log.fileno(), 1)
+    os.dup2(log.fileno(), 2)
+    t0 = time.time()
+    error = ""
+    try:
+        # Hold the stream so every all-reduce is queued before the first runs:
+        # the host then cannot refuse one after the proxy has already stopped.
+        torch.cuda._sleep(1 << 30)
+        for _ in range(n + 8):
+            T.ar.ext.allreduce(x, out, [], [])
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        error = str(e).splitlines()[0]
+    took = time.time() - t0
+    time.sleep(2)  # the proxy notices a trapped GPU on its next idle turn
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.dup2(saved[0], 1)
+    os.dup2(saved[1], 2)
+    log.seek(0)
+    text = log.read().decode(errors="replace")
+    sys.stderr.write(text)
+    # Pass only on the GPU's own trap: a CUDA error, and the kernel's "trapping"
+    # line. A host-side check in allreduce or the proxy's log alone is not a trap.
+    reasons = [line for line in text.splitlines() if "trapping" in line]
+    ok = "CUDA" in error and bool(reasons)
+    print(f"[inject] rank {T.rank}: {'trapped' if error else 'NO CUDA ERROR'} after {took:.1f} s"
+          f"{': ' + error if error else ''}; reason: {reasons[0] if reasons else 'NONE PRINTED'}", flush=True)
+    T.dog.at("inject result")
+    oks: list = [None] * T.world
+    dist.all_gather_object(oks, ok)
+    T.say(f"RESULT inject: {'PASS' if all(oks) else 'FAIL'}: ranks that trapped with a reason {oks}")
+    dist.barrier()
+    os._exit(0 if all(oks) else 1)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["mesh", "ring"], required=True)
@@ -276,6 +333,8 @@ def main():
     p.add_argument("--slow-copy-us", type=int, default=0,
                    help="check the two-shot sizes only, with rank 1's copy block 1 held back this long")
     p.add_argument("--wrap", action="store_true", help="start arx's seq 16 below 2^32 and run across the wrap")
+    p.add_argument("--inject-failure", type=int, metavar="N", default=0,
+                   help="fail rank 0's arx proxy at its Nth collective and expect every rank to trap")
     args = p.parse_args()
 
     os.environ["VLLM_ARX_RING"] = "1" if args.mode == "ring" else "0"
@@ -287,6 +346,10 @@ def main():
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     if args.slow_copy_us and rank == 1:
         os.environ["ARX_TEST_SLOW_COPY_US"] = str(args.slow_copy_us)
+    if args.inject_failure:
+        os.environ.setdefault("ARX_SPIN_TIMEOUT_S", "20")
+        if rank == 0:
+            os.environ["ARX_FAIL_AFTER"] = str(args.inject_failure)
     torch.cuda.set_device(0)
     dist.init_process_group("gloo", init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
                             rank=rank, world_size=world)
@@ -294,6 +357,8 @@ def main():
         if k.startswith(("NCCL_IB", "ARX_", "VLLM_ARX", "GLOO_")):
             print(f"[{args.mode}] rank {rank} {k}={os.environ[k]}", flush=True)
     T = Test(args.mode)
+    if args.inject_failure:
+        inject_failure(T, args.inject_failure)
     KB, MB = 1 << 10, 1 << 20
 
     if args.slow_copy_us:
