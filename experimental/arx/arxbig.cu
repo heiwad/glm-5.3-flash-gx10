@@ -111,6 +111,7 @@ struct Dev {
   unsigned* blocks;               // [kChunks * kMaxWorld] blocks done with each piece
   unsigned long long* work_next;  // next ring index to hand out
   unsigned long long* ready;      // highest flag_of(seq, piece) whose data has fully arrived
+  unsigned long long* published;  // highest flag_of(seq, piece) of a reduce_scatter this rank published
   int rank, world;
   int nslot;      // flag words per op
   uint32_t mask;  // the words of an op that carry data for this rank
@@ -177,6 +178,9 @@ __device__ void copy_publish(const Dev& d, const uint8_t* src, uint8_t* dst, siz
     if (threadIdx.x == 0 && atomicAdd(&d.blocks[c], 1) == gridDim.x - 1) {
       d.blocks[c] = 0;
       publish(d, op, seq, c, slice, lo, hi);
+      // For rs_kernel's own-publish wait. A block counts piece c only after
+      // piece c - 1, so pieces publish in order and a max is enough.
+      if (op == kReduceScatter) atomicMax(d.published, (unsigned long long)flag_of(seq, c));
     }
   }
 }
@@ -184,12 +188,19 @@ __device__ void copy_publish(const Dev& d, const uint8_t* src, uint8_t* dst, siz
 // Wait until every flag in d.mask for op reaches seq, piece c. Only
 // block 0 reads the pinned flags the NIC writes; it relays progress through a
 // device word, since many blocks polling those lines slows the NIC's writes.
-__device__ void wait_piece(const Dev& d, uint64_t op, uint64_t seq, int c) {
+// own_publish: also wait until this rank published piece c itself (rs_kernel).
+__device__ void wait_piece(const Dev& d, uint64_t op, uint64_t seq, int c, bool own_publish = false) {
   const uint64_t want = flag_of(seq, c);
   if (blockIdx.x == 0) {
     const volatile uint64_t* f = d.flag + (op == kAllGather ? 0 : d.nslot);
     if (threadIdx.x < d.nslot && (d.mask >> threadIdx.x & 1))
       while (ld_acquire_sys(f + threadIdx.x) < want) {}
+    if (own_publish && threadIdx.x == 0)
+      while (true) {
+        unsigned long long g;
+        asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(g) : "l"(d.published) : "memory");
+        if (g >= want) break;
+      }
     __syncthreads();
     if (threadIdx.x == 0) { __threadfence(); atomicMax(d.ready, (unsigned long long)want); }
   } else {
@@ -210,6 +221,9 @@ __global__ void ag_kernel(Dev d, const uint8_t* __restrict__ in, size_t slice, u
 }
 
 // out [slice / 2] bf16 = sum over ranks of their chunk `rank` of in.
+// This rank's own chunk is read from send, and the blocks that copied each
+// part of it are not the ones that sum it. Peers' flags do not depend on that
+// copy, so block 0 also waits for this rank's own publish of each piece.
 __global__ void rs_kernel(Dev d, const uint8_t* __restrict__ in, size_t slice, __nv_bfloat16* __restrict__ out,
                           uint64_t seq) {
   const int par = seq & 1;
@@ -220,7 +234,7 @@ __global__ void rs_kernel(Dev d, const uint8_t* __restrict__ in, size_t slice, _
   for (int c = 0; c < kChunks; ++c) {
     size_t lo, hi;
     piece(slice, c, lo, hi);
-    wait_piece(d, kReduceScatter, seq, c);
+    wait_piece(d, kReduceScatter, seq, c, true);
     for (size_t i = lo + ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 16; i < hi; i += stride) {
       float acc[8] = {};
       for (int src = 0; src < d.world; ++src) {  // rank order: every rank rounds the same way
@@ -642,6 +656,7 @@ Dev make_dev() {
   d.ag = S.ag; d.rs_send = S.rs_send; d.rs_recv = S.rs_recv; d.flag = S.flag; d.ctl = S.ctl;
   CK(cudaMalloc(&d.blocks, kChunks * kMaxWorld * 4)); CK(cudaMalloc(&d.ready, 8)); CK(cudaMalloc(&d.work_next, 8));
   CK(cudaMemset(d.blocks, 0, kChunks * kMaxWorld * 4)); CK(cudaMemset(d.ready, 0, 8)); CK(cudaMemset(d.work_next, 0, 8));
+  CK(cudaMalloc(&d.published, 8)); CK(cudaMemset(d.published, 0, 8));
   d.rank = S.rank; d.world = S.world; d.slot_bytes = S.slot_bytes;
   d.nslot = S.nslot;
   for (int src = 0; src < S.world; ++src) {

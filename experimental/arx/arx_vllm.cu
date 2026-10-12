@@ -44,6 +44,8 @@
 // so the bits match the one-shot sum). All-gather: the proxy writes the summed
 // chunk into every peer's slot, and the GPU assembles the chunks in rank order.
 // Each rank sends 2 (world - 1) / world partials' worth instead of world - 1.
+// The scatter's blocks sum parts of send[par] that other blocks copied, so they
+// wait for this rank's own publish as well as the peers' flags.
 // Ctl::mode tells the proxy which pattern a seq uses.
 //
 // vLLM form: prepare() returns this rank's connection details, the caller
@@ -226,9 +228,18 @@ __device__ __forceinline__ uint64_t publish_and_wait(Dev d, const __nv_bfloat16*
     __threadfence_system();
     d.ctl->seq = seq;
   }
+  // Block 0 also waits for this rank's own publish before it releases the
+  // others. ctl->seq reaches seq only after the last block's count, i.e. after
+  // every block copied its share of `in` into send[par]. The scatter then sums
+  // this rank's chunk of send[par] with a stride that does not line up with
+  // the copy's unless the chunk is a multiple of it, so its blocks read
+  // elements other blocks copied. Peers' flags do not depend on that copy, so
+  // without this wait a block could read last parity's data.
   if (blockIdx.x == 0) {
     if (threadIdx.x < 2 * d.world && threadIdx.x / 2 != d.rank)
       while (ld_acquire_sys(d.flag + threadIdx.x) < seq) {}
+    if (threadIdx.x == 0)
+      while (ld_acquire_sys(&d.ctl->seq) < seq) {}
     __syncthreads();
     if (threadIdx.x == 0) { __threadfence(); atomicExch(d.go, (unsigned)seq); }
   } else {

@@ -128,3 +128,26 @@ output reaches the passage's last line.
 Before the fix, with RecoverSSM on, 8 of 16 variants looped or turned to noise
 right after the boundary (TP=4, 2026-09-29). With `VLLM_GLM5NEXT_RECOVERSSM=0`,
 0 of 16. Needs `/usr/share/common-licenses/GPL-3` on the host that runs it.
+
+# arx two-shot
+
+## arx_twoshot_stale.py
+
+Whether a prefill step that goes through arx's two-shot all-reduce reads
+stale data. Standard library only, `--url` and `--model`, no other traffic on
+the server. It builds prompts whose last prefill step is 65, 89, 95 or 97
+tokens: above the one-shot limit and not a multiple of 8, which is where the
+scatter's blocks read parts of the send buffer that other blocks copied. Each
+prompt runs eight times, one at a time under fresh salts, with
+`prompt_logprobs`, and every run is compared with the first.
+
+`--chunk` must be what one step prefills for a lone request. The default,
+2304, is the entrypoint's `LONG_PREFILL_TOKEN_THRESHOLD`; if you change it or
+`MAX_NUM_BATCHED_TOKENS`, pass the smaller of the two.
+
+Without the scatter's wait for its own publish, runs differ only from rank 1's
+rows of the final step on (the second half at TP=2), since causal attention
+keeps a stale row from reaching anything before it. With the wait, runs on one
+boot should all match the first, and a difference that is left comes from
+somewhere else. `experimental/arx/test_ring.py` checks the same path bit for
+bit without a server.
